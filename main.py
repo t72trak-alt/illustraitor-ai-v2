@@ -70,7 +70,16 @@ DEMO_IMAGES = {
     "default": "https://images.unsplash.com/photo-1519681393784-d120267933ba"
 }
 
-# ========== КОРНЕВОЙ ЭНДПОИНТ (ВАЖНО ДЛЯ RENDER) ==========
+# ========== КРИТИЧЕСКИ ВАЖНЫЕ ЭНДПОИНТЫ ДЛЯ RENDER ==========
+
+@app.head("/")
+async def head_root():
+    """
+    HEAD запрос для Render health checks
+    Render использует HEAD / для проверки доступности
+    """
+    return
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     html_content = f"""
@@ -187,7 +196,7 @@ async def root():
                 <h2>📚 Доступные эндпоинты:</h2>
                 
                 <div class="endpoint">
-                    <span class="method">GET</span>
+                    <span class="method">GET/HEAD</span>
                     <span class="path">/</span>
                     <p>Эта страница (информация о сервере)</p>
                 </div>
@@ -209,6 +218,12 @@ async def root():
                     <span class="path">/generate</span>
                     <p>Сгенерировать изображение по описанию</p>
                 </div>
+                
+                <div class="endpoint">
+                    <span class="method">GET</span>
+                    <span class="path">/docs</span>
+                    <p>Swagger документация API</p>
+                </div>
             </div>
             
             <div class="links">
@@ -220,7 +235,8 @@ async def root():
             
             <div class="footer">
                 <p>Версия: 2.0.0 | Запущено: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                <p>Использует OpenAI DALL-E 3 API</p>
+                <p>Использует OpenAI DALL-E 3 API | Хостинг: Render</p>
+                <p>Status: <strong style="color: #4CAF50;">● Online</strong></p>
             </div>
         </div>
     </body>
@@ -228,59 +244,81 @@ async def root():
     """
     return HTMLResponse(content=html_content)
 
-# ========== HEALTH CHECK (ВАЖНО ДЛЯ RENDER) ==========
 @app.get("/health")
 async def health_check():
+    """
+    Health check endpoint для мониторинга Render
+    Render проверяет этот эндпоинт каждые несколько секунд
+    """
     return JSONResponse({
         "status": "healthy",
         "service": "illustraitor-ai",
         "version": "2.0.0",
         "timestamp": datetime.utcnow().isoformat(),
-        "environment": os.getenv("ENVIRONMENT", "development"),
+        "environment": os.getenv("ENVIRONMENT", "production"),
         "styles_count": len(STYLES),
-        "uptime": "running"
+        "uptime": "running",
+        "endpoints": {
+            "root": "/",
+            "health": "/health",
+            "styles": "/styles",
+            "generate": "/generate",
+            "docs": "/docs"
+        }
     })
 
-# ========== СТИЛИ ==========
+# ========== ОСНОВНЫЕ ЭНДПОИНТЫ API ==========
+
 @app.get("/styles")
 async def get_styles():
+    """Получить список всех доступных стилей генерации"""
     styles_list = []
     for key, value in STYLES.items():
         styles_list.append({
             "id": key,
             "name": value["name"],
-            "description": value["prompt"]
+            "description": value["prompt"],
+            "demo_image": DEMO_IMAGES.get(key, DEMO_IMAGES["default"])
         })
+    
     return {
         "status": "success",
         "styles": styles_list, 
         "total": len(styles_list),
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "note": "Для генерации используйте POST /generate"
     }
 
-# ========== ГЕНЕРАЦИЯ ==========
 @app.post("/generate")
 async def generate(request: GenerateRequest):
+    """
+    Основной эндпоинт генерации изображений
+    Поддерживает два режима: демо (без ключа) и OpenAI (с API ключом)
+    """
     start_time = datetime.now()
-    logger.info(f"=== НАЧАЛО GENERATE ===")
-    logger.info(f"Текст: {request.text[:50]}...")
-    logger.info(f"Стиль: {request.style}")
-    logger.info(f"Размер: {request.size}")
-    logger.info(f"API ключ предоставлен: {bool(request.api_key)}")
+    request_id = f"req_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.urandom(4).hex()}"
+    
+    logger.info(f"[{request_id}] === НАЧАЛО GENERATE ===")
+    logger.info(f"[{request_id}] Текст: {request.text[:50]}...")
+    logger.info(f"[{request_id}] Стиль: {request.style}")
+    logger.info(f"[{request_id}] Размер: {request.size}")
+    logger.info(f"[{request_id}] API ключ предоставлен: {bool(request.api_key)}")
     
     # Проверка стиля
     if request.style not in STYLES:
         available_styles = list(STYLES.keys())
-        logger.error(f"Неверный стиль: {request.style}. Доступные: {available_styles}")
+        logger.error(f"[{request_id}] Неверный стиль: {request.style}. Доступные: {available_styles}")
         raise HTTPException(
             status_code=400,
             detail={
+                "status": "error",
                 "error": f"Неверный стиль. Доступные: {', '.join(available_styles)}",
-                "available_styles": available_styles
+                "available_styles": available_styles,
+                "request_id": request_id
             }
         )
     
-    # Отключаем proxy (если есть проблемы с подключением)
+    # Очистка proxy переменных (для избежания проблем с подключением)
     proxy_vars = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']
     for var in proxy_vars:
         if var in os.environ:
@@ -289,40 +327,44 @@ async def generate(request: GenerateRequest):
     
     # Демо режим (если нет API ключа)
     if not request.api_key:
-        logger.info("Режим: ДЕМО")
+        logger.info(f"[{request_id}] Режим: ДЕМО")
         demo_image = DEMO_IMAGES.get(request.style, DEMO_IMAGES["default"])
+        width, height = request.size.split('x')
         
         return {
             "status": "success",
             "mode": "demo",
-            "image_url": f"{demo_image}?w={request.size.split('x')[0]}&h={request.size.split('x')[1]}&fit=crop",
+            "image_url": f"{demo_image}?w={width}&h={height}&fit=crop&auto=format",
             "message": f"Демо-режим: иллюстрация в стиле '{STYLES[request.style]['name']}'",
             "style": request.style,
             "style_name": STYLES[request.style]["name"],
             "size": request.size,
-            "generation_time": (datetime.now() - start_time).total_seconds(),
-            "note": "Для реальной генерации укажите ваш OpenAI API ключ"
+            "generation_time": round((datetime.now() - start_time).total_seconds(), 2),
+            "request_id": request_id,
+            "note": "Для реальной генерации укажите ваш OpenAI API ключ в поле api_key",
+            "documentation": "/docs"
         }
     
     # OpenAI режим
-    logger.info("Режим: OPENAI")
+    logger.info(f"[{request_id}] Режим: OPENAI")
     try:
         client = OpenAI(api_key=request.api_key)
-        logger.info("Клиент OpenAI создан успешно")
+        logger.info(f"[{request_id}] Клиент OpenAI создан успешно")
         
         prompt = f"{STYLES[request.style]['prompt']}: {request.text}"
-        logger.info(f"Формированный промпт: {prompt[:100]}...")
+        logger.info(f"[{request_id}] Формированный промпт: {prompt[:100]}...")
         
         response = client.images.generate(
             model="dall-e-3",
-            prompt=prompt,
+            prompt=prompt[:4000],  # Ограничение длины промпта
             size=request.size,
             quality=request.quality,
-            n=1
+            n=1,
+            style="vivid"  # или "natural"
         )
         
         image_url = response.data[0].url
-        logger.info(f"OpenAI успешно: {image_url[:50]}...")
+        logger.info(f"[{request_id}] OpenAI успешно: {image_url[:50]}...")
         
         return {
             "status": "success",
@@ -333,18 +375,24 @@ async def generate(request: GenerateRequest):
             "style_name": STYLES[request.style]["name"],
             "size": request.size,
             "quality": request.quality,
-            "generation_time": (datetime.now() - start_time).total_seconds(),
-            "model": "dall-e-3"
+            "generation_time": round((datetime.now() - start_time).total_seconds(), 2),
+            "model": "dall-e-3",
+            "request_id": request_id,
+            "prompt_used": prompt[:200]
         }
         
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Ошибка OpenAI: {error_msg}")
+        logger.error(f"[{request_id}] Ошибка OpenAI: {error_msg}")
         
         # Автоматический fallback на демо-режим при ошибке
         demo_image = DEMO_IMAGES.get(request.style, DEMO_IMAGES["default"])
+        width, height = request.size.split('x')
         
         # Определяем тип ошибки
+        error_type = "unknown_error"
+        user_message = "Ошибка генерации. Используется демо-изображение."
+        
         if 'Country' in error_msg or 'region' in error_msg or 'territory' in error_msg:
             error_type = "region_restriction"
             user_message = "OpenAI недоступен в вашем регионе. Используется демо-изображение."
@@ -354,43 +402,83 @@ async def generate(request: GenerateRequest):
         elif 'authentication' in error_msg or 'invalid' in error_msg or '401' in error_msg:
             error_type = "auth_error"
             user_message = "Неверный API ключ. Используется демо-изображение."
-        else:
-            error_type = "unknown_error"
-            user_message = "Ошибка генерации. Используется демо-изображение."
+        elif 'rate' in error_msg.lower() or 'limit' in error_msg.lower():
+            error_type = "rate_limit"
+            user_message = "Превышен лимит запросов. Используется демо-изображение."
+        elif 'timeout' in error_msg.lower():
+            error_type = "timeout"
+            user_message = "Таймаут подключения к OpenAI. Используется демо-изображение."
         
         return {
             "status": "success",  # Успех, потому что вернули fallback
             "mode": "fallback",
-            "image_url": f"{demo_image}?w={request.size.split('x')[0]}&h={request.size.split('x')[1]}&fit=crop",
+            "image_url": f"{demo_image}?w={width}&h={height}&fit=crop&auto=format",
             "message": user_message,
             "error_type": error_type,
             "original_error": error_msg[:200] if len(error_msg) > 200 else error_msg,
             "style": request.style,
             "style_name": STYLES[request.style]["name"],
-            "generation_time": (datetime.now() - start_time).total_seconds(),
-            "recovery_strategy": "fallback_to_demo"
+            "generation_time": round((datetime.now() - start_time).total_seconds(), 2),
+            "recovery_strategy": "fallback_to_demo",
+            "request_id": request_id,
+            "suggestion": "Проверьте API ключ или попробуйте позже"
         }
 
-# ========== ЭНДПОИНТ ДЛЯ ПРОВЕРКИ OPENAI ==========
 @app.get("/test-openai")
 async def test_openai(api_key: str):
-    """Проверка работоспособности OpenAI API ключа"""
+    """
+    Проверка работоспособности OpenAI API ключа
+    Использование: GET /test-openai?api_key=sk-...
+    """
     try:
         client = OpenAI(api_key=api_key)
-        # Простой запрос для проверки
         models = client.models.list()
+        
+        # Проверяем доступность DALL-E
+        dall_e_available = any('dall' in model.id.lower() for model in models.data)
+        
         return {
             "status": "success",
             "message": "OpenAI API ключ работает",
             "models_count": len(models.data),
-            "organization": getattr(client, 'organization', 'not_set')
+            "dall_e_available": dall_e_available,
+            "organization": getattr(client, 'organization', 'not_set'),
+            "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
         return {
             "status": "error",
             "error": str(e),
-            "message": "OpenAI API ключ не работает"
+            "message": "OpenAI API ключ не работает",
+            "timestamp": datetime.utcnow().isoformat()
         }
+
+@app.get("/info")
+async def get_info():
+    """Информация о сервере и доступных функциях"""
+    return {
+        "service": "Illustraitor AI",
+        "version": "2.0.0",
+        "description": "API для генерации изображений через DALL-E 3",
+        "features": {
+            "styles_count": len(STYLES),
+            "modes": ["demo", "openai", "fallback"],
+            "demo_images": "Unsplash",
+            "ai_model": "OpenAI DALL-E 3",
+            "max_prompt_length": 4000
+        },
+        "endpoints": {
+            "GET /": "Главная страница",
+            "GET /health": "Проверка состояния",
+            "GET /styles": "Список стилей",
+            "POST /generate": "Генерация изображения",
+            "GET /test-openai": "Проверка API ключа",
+            "GET /docs": "Swagger документация",
+            "GET /redoc": "ReDoc документация"
+        },
+        "timestamp": datetime.utcnow().isoformat(),
+        "status": "operational"
+    }
 
 # ========== СТАРТ СЕРВЕРА ==========
 if __name__ == "__main__":
@@ -399,14 +487,19 @@ if __name__ == "__main__":
     # Получаем порт из переменных окружения (Render передает через $PORT)
     port = int(os.environ.get("PORT", 8000))
     
-    logger.info(f"Запуск сервера на порту {port}")
-    logger.info(f"Доступно стилей: {len(STYLES)}")
-    logger.info(f"Документация: http://localhost:{port}/docs")
+    logger.info("=" * 50)
+    logger.info("🚀 Запуск Illustraitor AI API")
+    logger.info(f"📌 Порт: {port}")
+    logger.info(f"🎨 Стилей: {len(STYLES)}")
+    logger.info(f"📚 Документация: http://localhost:{port}/docs")
+    logger.info(f"🩺 Health check: http://localhost:{port}/health")
+    logger.info("=" * 50)
     
     uvicorn.run(
         app,
         host="0.0.0.0",  # Доступ с любого IP
         port=port,
         log_level="info",
-        access_log=True
+        access_log=True,
+        timeout_keep_alive=5
     )
